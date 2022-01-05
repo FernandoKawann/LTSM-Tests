@@ -1,0 +1,209 @@
+import psycopg2
+from iqoptionapi.stable_api import *  
+import time, json
+from datetime import datetime
+from dateutil import tz
+from talib.abstract import *
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+from btalib import RSI
+import matplotlib.pyplot as plt
+import time
+import sklearn
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from keras.models import Sequential
+from keras.layers import LSTM
+from keras.layers import Activation, Dense
+from matplotlib import *
+
+        ## PARÂMETROS DO PROGRAMA
+
+API = IQ_Option('mail@gmail.com','password')
+API.connect()
+API.change_balance('PRACTICE')
+
+
+periodo_mme_curta = 12
+periodo_mme_longa = 26
+quantidade_velas = 1000
+periodo_operacao = 1 #MINUTOS
+periodo_ifr = 14
+tendencia_VWAP = 0
+reversao_MACD = 0
+rompimento_IFR = 0
+periodo_velas = 300
+par = "EURUSD-OTC"
+data_inicial = ""
+data_final = ""
+look_back = 100
+
+        ## FIM DOS PARÂMETROS 
+
+if API.check_connect() == False:
+    print('Erro na conexão')           ##CHECAMOS A CONEXÃO COM A API
+    API.reconnect()
+else:
+    print('conexão bem sucedida')
+    
+time.sleep(1)
+
+
+### INÍCIO DAS FUNÇÕES ##
+
+def timestamp_converter(x):
+    hora = datetime.strptime(datetime.utcfromtimestamp(x).strftime('%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S')
+    hora = hora.replace(tzinfo=tz.gettz('GMT'))
+    return  str(hora.astimezone(tz.gettz('America/Sao Paulo')))[:-3] 
+
+def primeira_execucao():
+
+    conn = psycopg2.connect(dbname='DADOS', user='postgres', password='123123', host='localhost') ##CONEXÃO ABERTA
+    cur = conn.cursor()
+    velas = API.get_candles(par, periodo_velas , quantidade_velas , time.time())  #PEGAMOS AS VELAS DA API
+
+    cur.execute("TRUNCATE TABLE VELAS RESTART IDENTITY")  ##LIMPAMOS AS TABELAS E FAZEMOS RESEED
+    conn.commit()
+    cur.execute("TRUNCATE TABLE IFR RESTART IDENTITY")
+    conn.commit()
+    
+    count = 1
+    while (count < len(velas)):      #REALIZAMOS O INSERT INICIAL DAS VELAS NO BANCO     
+
+        cur.execute("INSERT INTO VELAS (nvlhigh, nvllow, nvlopen, nvlclose, dvlvolume, nvldiferenca, tdtvela) VALUES ('" + str(velas[count]['max']) +"','"+ str(velas[count]['min']) + "','" + str(velas[count]['open']) + "','" + str(velas[count]['close']) + "','" + str(velas[count]['volume'])+ "','" + str ( (velas[count]['close'] / velas[count-1]['close'] - 1) * 100 ) + "','" + str(timestamp_converter(velas[count]['from'])) + "')" )
+        
+
+        conn.commit()
+        count = count + 1
+
+    cur.execute("INSERT INTO IFR (ncdifr) SELECT * FROM generate_series(1," + str(quantidade_velas - 1) + ")")  ##INSERIMOS OS ÍNDICES NA TABELA IFR
+    conn.commit()
+
+
+    cur.close()  ##FECHANDO AS CONEXÕES
+    conn.close()
+
+def pega_velas(par, periodo_velas):
+        ##PEGAMOS AS VELAS DA API
+    
+    velas = API.get_candles(par, int(periodo_velas) , quantidade_velas , time.time())     
+    
+    
+    ## INSERÇÃO DAS VELAS NO BANCO
+    conn = psycopg2.connect(dbname='DADOS', user='postgres', password='123123', host='localhost') ##CONEXÃO ABERTA
+    cur = conn.cursor()
+    count = 1
+    while (count < len(velas)):
+           
+        #cur.execute("INSERT INTO VELAS (nvlhigh, nvllow, nvlopen, nvlclose, dvlvolume, nvldiferenca, tdtvela) VALUES ('" + str(velas[count]['max']) +"','"+ str(velas[count]['min']) + "','" + str(velas[count]['open']) + "','" + str(velas[count]['close']) + "','" + str(velas[count]['volume'])+ "','" + str ( (velas[count]['close'] / velas[count-1]['close'] - 1) * 100 ) + "','" + str(timestamp_converter(velas[count]['from'])) + "')" )
+        cur.execute("UPDATE VELAS SET nvlhigh =" +"'" + str(velas[count]['max']) +"', nvllow = '" + str(velas[count]['min']) + "', nvlopen = '"+ str(velas[count]['open']) +"', nvlclose = '"+ str(velas[count]['close']) + "', dvlvolume = '" + str(velas[count]['volume'])+ "', nvldiferenca = '"+ str ( (velas[count]['close'] / velas[count-1]['close'] - 1) * 100 ) + "', tdtvela = '" + str(timestamp_converter(velas[count]['from']))+"' WHERE ncdvela ="+str(count))
+
+        conn.commit()
+        count = count + 1
+
+    cur.execute("SELECT MAX(tdtvela) as datafinal, MIN(tdtvela) as datainicial FROM VELAS")
+    datas = pd.DataFrame(cur.fetchall())
+
+    data_inicial = datas.iat[0,1]
+    data_final = datas.iat[0,0]
+    cur.close()  ##FECHANDO AS CONEXÕES
+    conn.close()
+
+
+
+################################################################################################################################
+
+##primeira_execucao()
+pega_velas(par, periodo_velas)
+
+conn = psycopg2.connect(dbname='DADOS', user='postgres', password='123123', host='localhost') ##CONEXÃO ABERTA
+cur = conn.cursor()
+
+cur.execute("select * from velas order by tdtvela asc")                    
+df = pd.DataFrame(cur.fetchall()) 
+df.tail()
+
+cur.close()  ##FECHANDO AS CONEXÕES
+conn.close()
+
+
+           
+data=df.sort_index(ascending=True,axis=0)
+new_dataset =pd.DataFrame(index=range(0,len(df)),columns=['close'])
+
+
+for i in range(0,len(data)):
+    #new_dataset["Date"][i]= data.index.values
+    #new_dataset["Date"][i]= data.index.strftime("%m/%d/%Y")[i]
+    new_dataset['close'][i]=data[4][i]
+
+
+final_dataset=new_dataset.close.values
+
+
+train_size = int(df.shape[0]*0.80)
+train_data=final_dataset[:train_size]
+valid_data=final_dataset[train_size:]
+
+new_dataset.index=data.index
+
+
+scaler=MinMaxScaler(feature_range=(0,1))
+scaled_data=scaler.fit_transform(final_dataset.reshape(-1, 1))
+
+
+x_train_data,y_train_data=[],[]
+for i in range(look_back,len(train_data)):
+    x_train_data.append(scaled_data[i-look_back:i,0])
+    y_train_data.append(scaled_data[i,0])
+
+        
+x_train_data,y_train_data=np.array(x_train_data),np.array(y_train_data)
+x_train_data=np.reshape(x_train_data,(x_train_data.shape[0],x_train_data.shape[1],1))
+
+##train
+
+print("train V")
+lstm_model=Sequential()
+lstm_model.add(LSTM(units=50,return_sequences=True,input_shape=(x_train_data.shape[1],1)))
+lstm_model.add(LSTM(units=50))
+lstm_model.add(Dense(1))
+
+lstm_model.compile(loss='mean_squared_error',optimizer='adam')
+lstm_model.fit(x_train_data,y_train_data,epochs=1,batch_size=1,verbose=2)
+
+
+##test
+
+
+inputs_data=new_dataset[len(new_dataset)-len(valid_data)-look_back:].values
+inputs_data=inputs_data.reshape(-1,1)
+inputs_data=scaler.transform(inputs_data)
+valid_data=valid_data.reshape(-1,1)
+
+X_test=[]
+for i in range(look_back,inputs_data.shape[0]):
+    X_test.append(inputs_data[i-look_back:i,0])
+X_test=np.array(X_test)
+X_test=np.reshape(X_test,(X_test.shape[0],X_test.shape[1],1))
+predicted_closing_price=lstm_model.predict(X_test, verbose=1, steps=500)
+predicted_closing_price=scaler.inverse_transform(predicted_closing_price)
+
+print(f'MAE {mean_absolute_error(valid_data, predicted_closing_price)}')
+print(f'MSE {mean_squared_error(valid_data, predicted_closing_price)}')
+print(f'RMSE {np.sqrt(mean_squared_error(valid_data, predicted_closing_price))}')
+print(f'R2 {r2_score(valid_data, predicted_closing_price)}')
+
+print(f"Prediction for the next Trading day is {predicted_closing_price[-1]}")
+
+
+
+plt.figure(figsize=(10,10))
+plt.plot(valid_data)
+plt.plot(predicted_closing_price)
+plt.plot(predicted_closing_price[-1])
+plt.xlabel("Data")
+plt.ylabel("Preço")
+plt.title("Preço do par " + par)
+plt.show()
